@@ -1,0 +1,1 @@
+As an example script, I am training a concatenation of a ViT-b-32 and distilbert with a q-former like connector and DDQN architecture.

@@ -1,0 +1,426 @@
+import numpy as np
+import pandas as pd 
+
+import torch 
+import torch.nn as nn 
+import torch.nn.functional as F
+
+import torchvision
+from torchvision import transforms
+from torchvision.models.vision_transformer import VisionTransformer
+
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForSequenceClassification
+)
+
+import os, cv2
+import utils
+
+
+class QFormerBlock(nn.Module):
+    def __init__(self, visual_dim, num_queries, num_heads, dropout_rate=0.1):
+        super(QFormerBlock, self).__init__()
+
+        # Initialize learned queries
+        self.learned_queries = nn.Parameter(torch.randn(num_queries, visual_dim))
+
+        # Multi-head attention for cross-modal interaction
+        self.cross_attention = nn.MultiheadAttention(embed_dim=visual_dim, num_heads=num_heads, dropout=dropout_rate)
+
+        # Layer normalization and Feed-forward network for visual features
+        self.norm = nn.LayerNorm(visual_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(visual_dim, visual_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(visual_dim * 4, visual_dim)
+        )
+
+    def forward(self, visual_features):
+        # Assuming visual_features is of shape (batch_size, num_patches, visual_dim)
+
+        # Expand learned queries to match batch size
+        batch_size = visual_features.size(0)
+        queries = self.learned_queries.unsqueeze(0).expand(batch_size, -1, -1)
+
+
+        # Cross attention using learned queries and visual features
+        attended_visual, _ = self.cross_attention(query=queries, key=visual_features, value=visual_features)
+
+        # Add & Norm
+        visual_features = self.norm(visual_features + attended_visual)
+
+        # Feed-forward for visual modality
+        visual_features = visual_features + self.ffn(visual_features)
+
+        return visual_features
+
+
+
+class VLM_base(nn.Module):
+    """
+    Using a BLIP-2 style Q-former, connect a ViT model to a BERT-tiny model.
+    Both models are pretrained, and the positional encoding for the ViT model is 
+    re-initialized to accomodate for the new resolution (1366x768x3).
+    """
+    def __init__(self, action_space=6, device=torch.device('cuda')):
+        super().__init__()
+        vit = torchvision.models.vit_b_32(pretrained=True) # use 32 to reduce computational load. Still, presumeably 1008 patches
+
+        # make necessary changes to the ViT model
+        self.vit = self._adjust_vit(vit)
+
+        self.transform = transforms.Compose([
+            #transforms.Resize((384, 640)), # reduced load to 240 patches
+            #transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229,0.224,0.225]
+            )
+        ])
+
+
+        # initialize the language model base 
+        bert = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased")
+        self.tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+
+        # split bert into the embedder and transformer
+        self.word_embeddings = bert.distilbert.embeddings.word_embeddings
+        self.bert = bert
+
+        # replace classifier head with rndm init linear layer 
+        self.bert.classifier = nn.Identity()#nn.Linear(768, action_space)
+        self.value_stream = nn.Sequential(
+            nn.Linear(768, 256),
+            nn.ReLU(),
+            nn.Linear(256, action_space)
+        )
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(768, 256),
+            nn.ReLU(),
+            nn.Linear(256, action_space)
+        )
+        #self.bert_embedder = bert.distilbert.embeddings
+        #self.bert = bert.distilbert.transformer
+
+        # extract head mask
+        #self.head_mask = bert.distilbert.get_head_mask(None, bert.config.num_hidden_layers)
+
+        # initialize a q-former style connector
+        self.q_former = QFormerBlock(
+            visual_dim=768,
+            num_queries=240,
+            num_heads=12,
+            dropout_rate=0.1
+        )
+
+
+        # make sure that gradients are activated for all parameters
+        for param in self.parameters():
+            param.requires_grad = True
+
+
+        self.device = device
+
+
+
+    def _adjust_vit(self, vit):
+        """
+        Re-initialize the positional encoding of the ViT model to accomodate for the 
+        new resolution (1366x768x3).
+
+        The image is re-shaped to (640, 384, 3) to reduce the computational load. with a patch size of 32, this
+        will produce 240 patches.
+        """
+
+        def _adjusted_process_input(self, x: torch.Tensor) -> torch.Tensor:
+            n, c, h, w = x.shape
+            p = self.patch_size
+            torch._assert(h == 384, f"Wrong image height! Expected {384} but got {h}!")
+            torch._assert(w == 640, f"Wrong image width! Expected {640} but got {w}!")
+            n_h = h // p
+            n_w = w // p
+
+            # (n, c, h, w) -> (n, hidden_dim, n_h, n_w)
+            x = self.conv_proj(x)
+            # (n, hidden_dim, n_h, n_w) -> (n, hidden_dim, (n_h * n_w))
+            x = x.reshape(n, self.hidden_dim, n_h * n_w)
+
+            # (n, hidden_dim, (n_h * n_w)) -> (n, (n_h * n_w), hidden_dim)
+            # The self attention layer expects inputs in the format (N, S, E)
+            # where S is the source sequence length, N is the batch size, E is the
+            # embedding dimension
+            x = x.permute(0, 2, 1)
+            return x 
+        
+        # re-initialize the process_input function
+        #vit.encoder._process_input = _adjusted_process_input.__get__(vit.encoder)
+        # Override the _process_input method
+        VisionTransformer._process_input = _adjusted_process_input
+        #vit.encoder._process_input = _adjusted_process_input
+
+        # re-initialize the positional encoding
+        vit.encoder.pos_embedding = nn.Parameter(torch.empty(1, 240, 768).normal_(std=0.02))
+
+        # remove the final layer norm and head
+        vit.heads = nn.Identity()
+        vit.encoder.ln = nn.Identity()
+
+        # lastly change the vit forward function
+        def _adjusted_forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Reshape and permute the input tensor
+            x = self._process_input(x)
+            n = x.shape[0]
+
+            x = self.encoder(x)
+            return x
+        
+        VisionTransformer.forward = _adjusted_forward
+
+        return vit
+    
+
+    def forward(self, img:torch.tensor, text:str) -> torch.tensor:
+        # if not tensor, convert to tensor
+        if not isinstance(img, torch.Tensor):
+            img = transforms.ToTensor()(img)
+
+        # frist process the image
+        img = self.transform(img)
+
+        # push to device
+        img = img.to(self.device)
+
+        # if necessary add a batch dimension
+        if len(img.shape) == 3:
+            img = img.unsqueeze(0)
+
+        # pass the image through the ViT model
+        img = self.vit(img)
+
+        # pass the image through the q-former
+        img = self.q_former(img)
+
+        # tokenize the text
+        text = self.tokenizer(text, padding=True, return_tensors="pt")
+
+        # get token embeddings
+        text = self.word_embeddings(text['input_ids'])
+
+        # concatenate the image and text
+        img_text_input = torch.cat((img, text), dim=1)
+
+        # pass through distilbert
+        output = self.bert(
+            input_ids=None,
+            inputs_embeds=img_text_input,
+        )['logits']
+
+
+        value = self.value_stream(output)
+        advantage = self.advantage_stream(output)
+
+        return value + advantage - advantage.mean()
+
+    
+    def _test_vit(self, x):
+        """
+        Test the ViT model with a dummy input
+        """
+        x = self.transform(x)
+        x = x.unsqueeze(0)
+        x = self.vit(x)
+        return x
+
+
+
+
+class Agent:
+    """
+    This  class is a wrapper around the VLM_base class to enable
+    DDQN style learning.
+    """
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.policy_net = VLM_base(device=self.device)
+        self.target_net = VLM_base(device=self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+
+        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=3e-4)
+        self.loss_fn = torch.nn.SmoothL1Loss() #nn.MSELoss()
+
+        self.policy_net.to(self.device)
+        self.target_net.to(self.device)
+
+        # initialize standard DQN parameters and objects
+        self.epsilon = 0.8
+        self.epsilon_decay = 0.999
+        self.gamma = 0.99
+        self.batch_size = 32
+        self.num_episodes = 10_000
+        self.target_net_update_freq = 1000
+        self.learn_counter = 0
+
+
+        # initialize Replay Memory
+        self.memory = utils.ReplayMemory(
+            capacity=10_000
+        )
+
+    def get_action(self, state, exploration=False):
+        """
+        Given a state, return the action that the agent should take.
+        """
+        if exploration and np.random.rand() < self.epsilon:
+            return np.random.randint(0, 6) #torch.randint(0, 6, (1,))#np.random.randint(0, 6)
+        else:
+            return self._get_greedy_action(state)
+
+    def _get_greedy_action(self, state):
+        """
+        Given a state, return the greedy action that the agent should take.
+        """
+        #state = state #torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+        q_values = self.target_net(state, self.task_description) 
+        action = torch.argmax(q_values).to('cpu').item()
+        return action
+    
+    def _decay_epsilon(self):
+        """
+        Decay the epsilon value.
+        """
+        self.epsilon *= self.epsilon_decay
+
+
+    def train(self, env):
+        # initialize tracker df 
+        tracker_df = pd.DataFrame(
+            columns=[
+                "episode", "steps", "cum_reward", "episode_reward", "final_distance", "epsilon"
+            ]
+        )
+
+
+        for episode in range(self.num_episodes):
+            # reset the environment 
+            obs, self.task_description = env.reset()
+            # convert to cv2 and resize obs 
+            obs = cv2.resize(obs.transpose(1,2,0), dsize=(640, 384))#.transpose(2,0,1)
+            # transform the observation
+            state = obs #utils.process_state(obs)
+            total_reward = 0.0 
+            done = False
+            steps_done = 0
+            while not done:
+                # get the action
+                action = self.get_action(state, exploration=True)
+                steps_done += 1 
+
+                # take the action
+                next_obs, reward, done, info = env.step(action)
+                next_obs = cv2.resize(next_obs.transpose(1,2,0), dsize=(640, 384))#.transpose(2,0,1)
+
+                if done and info[0] == 1:
+                    # give extra reward for clicking on target
+                    reward += 50
+
+                # transform the observation
+                next_state = next_obs # utils.process_state(next_obs)
+
+                # add the transition to the replay memory (convert to tensors first)
+                self.memory.push(
+                    transforms.ToTensor()(state).unsqueeze(0), #torch.from_numpy(state).float().unsqueeze(0), 
+                    torch.tensor([action]), 
+                    torch.tensor([reward]),
+                    transforms.ToTensor()(next_state).unsqueeze(0), #torch.from_numpy(next_state).float().unsqueeze(0), 
+                    torch.tensor([done], dtype=torch.int), 
+                    self.task_description
+                )
+                #self.memory.push(state, action, reward, next_state, done, self.task_description)
+
+                # update the state
+                state = next_state
+
+                # update the total reward
+                total_reward += reward
+
+                # train the model
+                if not steps_done%10:
+                    self._train_step()
+
+
+
+                # print verbose 
+                if done:
+                    # store the results in tracker df, print & break
+                    tracker_df.loc[len(tracker_df)] = [episode, steps_done, total_reward, info[0], info[1], self.epsilon]
+                    print(f"Episode: {episode}, Final Distance: {info[1]}, Steps: {steps_done}, Total Reward: {total_reward}, Episode Reward: {info[0]}, Epsilon: {self.epsilon}")
+                    # decay epsilon
+                    self._decay_epsilon()
+                    break
+
+
+            # store the results in the tracker df 
+            tracker_df.to_csv(os.path.join("results", "tracker_df.csv"))
+
+
+    def _train_step(self):
+        # check if enough items in memory
+        if len(self.memory) < self.batch_size:
+            return
+        
+
+        avg_loss = 0
+        n_iter = int(len(self.memory)/self.batch_size)
+        for i in range(n_iter):
+            # sample batch from memory 
+            state, action, reward, state_, done, task_desc = self.memory.sample(self.batch_size)
+
+            # convert to tensors and concatenate
+            state = torch.cat(state).to(self.device)
+            action = torch.cat(action).to(self.device)
+            state_ = torch.cat(state_).to(self.device)
+            reward = torch.cat(reward).to(self.device)
+            done = torch.tensor(done, dtype=torch.int).to(self.device)
+            #task_desc = torch.cat(task_desc).to(self.device)
+
+            q = self.policy_net(state, task_desc).gather(1, action.view(-1, 1))   
+            qmax = self.target_net(state_, task_desc).max(dim=1)[0].detach()
+            #q_eval = self.policy_net(state).gather(1, action)
+
+            nonterminal_target = reward + self.gamma * qmax
+            terminal_target = reward
+            q_target = (1 - done) * nonterminal_target + done * terminal_target
+
+            loss = self.loss_fn(q.view(-1), q_target)
+            avg_loss += loss.item()
+            # Perform backward propagation and optimization step
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            # increment the learn counter
+            self.learn_counter += 1 
+
+            # check if target_net should be replaced
+            if not self.learn_counter % self.target_net_update_freq:
+                print('Updating target network')
+                self.target_net.load_state_dict(self.policy_net.state_dict())
+
+        return avg_loss / n_iter
+               
+
+    
+
+
+
+# debug 
+if __name__ == "__main__":
+    model = VLM_base()
+    test_img = torch.randn(3, 768, 1366)
+    test_img = transforms.ToPILImage()(test_img)
+    test_text = ["This is a test sentence."]
+    # change to PIL format
+    #print(model._test_vit(test_img))
+    print(model(test_img, test_text))
