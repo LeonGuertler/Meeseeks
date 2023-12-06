@@ -1,0 +1,17 @@
+Given the above observation, please provide a small number of actions in the following format:
+[('key', 'home'), ('mouse', (x,y), 'Right'), etc.]
+
+The available actions are:
+- all keys on a standard keyboard (for special keys, use the name (i.e. 'backspace', 'enter', etc.))
+- you can move the mouse using x,y coordinates (i.e. (100, 200)) and execute a click using 'Left' or 'Right'
+
+Please note that the actions will be executed in the order they are provided. 
+
+Here is an example of what you reply should look like.
+
+Plan: To access google.com, I first need to open the browser by pressing the windows key and typing 'chrome'. Then I need to press enter to open the browser. Once the browser is open, I need to type 'google.com' in the address bar and press enter.
+Actions: [('key', 'win'), ('key', 'c'), ('key', 'h'), ('key', 'r'), ('key', 'o'), ('key', 'm'), ('key', 'e'), ('key', 'enter'), etc.]
+
+Now please follow the above layout with your own action plan. Do not add any comments or newline symbols after you have typed 'Actions:'.
+
+Plan: 

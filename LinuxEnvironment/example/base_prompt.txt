@@ -1,0 +1,1 @@
+Your task is to nagivage a linux desktop using only the keyboard and mouse. I'll provide you with a screencapture of the desktop. Please navigate to the webbrowser and type google.com into the address bar. Below is the current observation and your available actions.
